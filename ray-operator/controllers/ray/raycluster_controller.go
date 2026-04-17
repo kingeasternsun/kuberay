@@ -754,13 +754,18 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 	}
 
 	// Reconcile worker pods now
-	for _, worker := range instance.Spec.WorkerGroupSpecs {
+	workerSpecs := instance.Spec.WorkerGroupSpecs
+	priorWorkerPodTotalFromPriorGroups := 0
+	for groupIndex := range workerSpecs {
+		worker := workerSpecs[groupIndex]
+		numExpectedWorkerPods := int(utils.GetWorkerGroupDesiredReplicas(worker))
+		priorWorkerPodTotal := priorWorkerPodTotalFromPriorGroups
+		priorWorkerPodTotalFromPriorGroups += numExpectedWorkerPods
 		if !r.rayClusterScaleExpectation.IsSatisfied(ctx, instance.Namespace, instance.Name, worker.GroupName) {
 			logger.Info("reconcilePods", "worker group", worker.GroupName, "Expectation", "NotSatisfiedGroupExpectations, reconcile the group later")
 			continue
 		}
 		// workerReplicas will store the target number of pods for this worker group.
-		numExpectedWorkerPods := int(utils.GetWorkerGroupDesiredReplicas(worker))
 		logger.Info("reconcilePods", "desired workerReplicas (always adhering to minReplicas/maxReplica)", numExpectedWorkerPods, "worker group", worker.GroupName, "maxReplicas", worker.MaxReplicas, "minReplicas", worker.MinReplicas, "replicas", worker.Replicas)
 
 		workerPods := corev1.PodList{}
@@ -782,7 +787,7 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 
 		isRayMultiHostIndexing := worker.NumOfHosts > 1 && features.Enabled(features.RayMultiHostIndexing)
 		if isRayMultiHostIndexing {
-			if err := r.reconcileMultiHostWorkerGroup(ctx, instance, &worker, workerPods.Items); err != nil {
+			if err := r.reconcileMultiHostWorkerGroup(ctx, instance, &worker, workerPods.Items, priorWorkerPodTotal); err != nil {
 				return err
 			}
 			// Skip to the next worker as we've already handled multi-host reconciliation.
@@ -871,6 +876,22 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 		if diff > 0 {
 			// pods need to be added
 			logger.Info("reconcilePods", "Number workers to add", diff, "Worker group", worker.GroupName)
+			var hcclRanks []int
+			if utils.IsNPUCluster(instance) {
+				occupied := utils.HcclRankSetFromPods(runningPods.Items)
+				hcclRanks = utils.AllocateHcclWorkerRanks(occupied, priorWorkerPodTotal, numExpectedWorkerPods)
+				if len(hcclRanks) > diff {
+					hcclRanks = hcclRanks[:diff]
+				}
+				logger.Info("reconcilePods: allocated HCCL ranks for single-host worker group",
+					"workerGroup", worker.GroupName,
+					"occupiedRanks", occupied,
+					"priorWorkerPods", priorWorkerPodTotal,
+					"numExpectedWorkerPods", numExpectedWorkerPods,
+					"allocatedRanks", hcclRanks,
+					"podsToCreate", diff,
+					"allocatedRanksCount", len(hcclRanks))
+			}
 			if features.Enabled(features.RayMultiHostIndexing) {
 				newReplicaIndex := 0
 				// create all workers of this group
@@ -881,7 +902,19 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 					}
 					validReplicaIndices[newReplicaIndex] = true
 					logger.Info("reconcilePods", "creating worker for group", worker.GroupName, "index", i, "total", diff, "replicaIndex", newReplicaIndex)
-					if err := r.createWorkerPodWithIndex(ctx, *instance, *worker.DeepCopy(), "", newReplicaIndex, 0); err != nil {
+					hcclRank := 0
+					if len(hcclRanks) > 0 {
+						if i < len(hcclRanks) {
+							hcclRank = hcclRanks[i]
+						} else {
+							logger.Info("reconcilePods: warning HCCL rank index out of bounds, fallback to rank 0",
+								"workerGroup", worker.GroupName,
+								"rankIndex", i,
+								"allocatedRanksCount", len(hcclRanks),
+								"podsToCreate", diff)
+						}
+					}
+					if err := r.createWorkerPodWithIndex(ctx, *instance, *worker.DeepCopy(), "", newReplicaIndex, 0, hcclRank); err != nil {
 						return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
 					}
 				}
@@ -889,7 +922,19 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 				// create all workers of this group
 				for i := range diff {
 					logger.Info("reconcilePods", "creating worker for group", worker.GroupName, "index", i, "total", diff)
-					if err := r.createWorkerPod(ctx, *instance, *worker.DeepCopy()); err != nil {
+					hcclRank := 0
+					if len(hcclRanks) > 0 {
+						if i < len(hcclRanks) {
+							hcclRank = hcclRanks[i]
+						} else {
+							logger.Info("reconcilePods: warning HCCL rank index out of bounds, fallback to rank 0",
+								"workerGroup", worker.GroupName,
+								"rankIndex", i,
+								"allocatedRanksCount", len(hcclRanks),
+								"podsToCreate", diff)
+						}
+					}
+					if err := r.createWorkerPod(ctx, *instance, *worker.DeepCopy(), hcclRank); err != nil {
 						return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
 					}
 				}
@@ -966,7 +1011,7 @@ func (r *RayClusterReconciler) deletePods(ctx context.Context, instance *rayv1.R
 // 1. Deleting incomplete or unhealthy multi-host groups atomically.
 // 2. Explicit deletes of entire multi-host groups for the autoscaler.
 // 3. Scale up/down of multi-host groups.
-func (r *RayClusterReconciler) reconcileMultiHostWorkerGroup(ctx context.Context, instance *rayv1.RayCluster, worker *rayv1.WorkerGroupSpec, workerPods []corev1.Pod) error {
+func (r *RayClusterReconciler) reconcileMultiHostWorkerGroup(ctx context.Context, instance *rayv1.RayCluster, worker *rayv1.WorkerGroupSpec, workerPods []corev1.Pod, priorWorkerPodTotal int) error {
 	logger := ctrl.LoggerFrom(ctx)
 
 	// 1. Group existing pods by ray.io/worker-group-replica-index.
@@ -1084,6 +1129,33 @@ func (r *RayClusterReconciler) reconcileMultiHostWorkerGroup(ctx context.Context
 	logger.Info("Reconciling multi-host group", "group", worker.GroupName, "expectedReplicas", numExpectedReplicas, "runningReplicas", numRunningReplicas, "replicasToCreate", replicasToCreate, "inUseIndices", validReplicaIndices)
 	if replicasToCreate > 0 {
 		logger.Info("Scaling up multi-host group", "group", worker.GroupName, "replicasToCreate", replicasToCreate)
+		newPodsTotal := replicasToCreate * int(worker.NumOfHosts)
+		var hcclRanks []int
+		if utils.IsNPUCluster(instance) {
+			// workerPods is the list from the start of reconcile; exclude Pods deleted in steps 3–4 so freed
+			// hccl/rankIndex values are not treated as still occupied.
+			surviving := make([]corev1.Pod, 0, len(workerPods))
+			for i := range workerPods {
+				if _, del := deletedPods[workerPods[i].Name]; del {
+					continue
+				}
+				surviving = append(surviving, workerPods[i])
+			}
+			occupied := utils.HcclRankSetFromPods(surviving)
+			hcclRanks = utils.AllocateHcclWorkerRanks(occupied, priorWorkerPodTotal, numExpectedWorkerPods)
+			if len(hcclRanks) > newPodsTotal {
+				hcclRanks = hcclRanks[:newPodsTotal]
+			}
+
+			logger.Info("reconcilePods: allocated HCCL ranks for single-host worker group",
+				"workerGroup", worker.GroupName,
+				"occupiedRanks", occupied,
+				"priorWorkerPods", priorWorkerPodTotal,
+				"numExpectedWorkerPods", numExpectedWorkerPods,
+				"allocatedRanks", hcclRanks,
+				"allocatedRanksCount", len(hcclRanks))
+		}
+		hcclIdx := 0
 		newReplicaIndex := 0 // Find the next available index starting from 0
 		for range replicasToCreate {
 			for validReplicaIndices[newReplicaIndex] {
@@ -1093,7 +1165,20 @@ func (r *RayClusterReconciler) reconcileMultiHostWorkerGroup(ctx context.Context
 			replicaName := utils.GenerateRayWorkerReplicaGroupName(worker.GroupName)
 			logger.Info("Creating new replica group", "group", worker.GroupName, "replicaName", replicaName, "replicaIndex", newReplicaIndex)
 			for j := 0; j < int(worker.NumOfHosts); j++ {
-				if err := r.createWorkerPodWithIndex(ctx, *instance, *worker.DeepCopy(), replicaName, newReplicaIndex, j); err != nil {
+				hcclRank := 0
+				if len(hcclRanks) > 0 {
+					if hcclIdx < len(hcclRanks) {
+						hcclRank = hcclRanks[hcclIdx]
+						hcclIdx++
+					} else {
+						logger.Info("reconcileMultiHostWorkerGroup: warning HCCL rank index out of bounds, fallback to rank 0",
+							"group", worker.GroupName,
+							"rankIndex", hcclIdx,
+							"allocatedRanksCount", len(hcclRanks),
+							"newPodsTotal", newPodsTotal)
+					}
+				}
+				if err := r.createWorkerPodWithIndex(ctx, *instance, *worker.DeepCopy(), replicaName, newReplicaIndex, j, hcclRank); err != nil {
 					return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
 				}
 			}
@@ -1321,6 +1406,7 @@ func (r *RayClusterReconciler) createHeadPod(ctx context.Context, instance rayv1
 		pod.Annotations[utils.UpgradeStrategyRecreateHashKey] = clusterHash
 		pod.Annotations[utils.KubeRayVersion] = utils.KUBERAY_VERSION
 	}
+	utils.AddHcclRankIndexToPod(&pod, instance, 0)
 
 	// check if the batch scheduler integration is enabled
 	// call the scheduler plugin if so
@@ -1342,11 +1428,11 @@ func (r *RayClusterReconciler) createHeadPod(ctx context.Context, instance rayv1
 	return nil
 }
 
-func (r *RayClusterReconciler) createWorkerPod(ctx context.Context, instance rayv1.RayCluster, worker rayv1.WorkerGroupSpec) error {
+func (r *RayClusterReconciler) createWorkerPod(ctx context.Context, instance rayv1.RayCluster, worker rayv1.WorkerGroupSpec, hcclRank int) error {
 	logger := ctrl.LoggerFrom(ctx)
 
 	// build the pod then create it
-	pod := r.buildWorkerPod(ctx, instance, worker, "", 0, 0)
+	pod := r.buildWorkerPod(ctx, instance, worker, "", 0, 0, hcclRank)
 	if r.options.BatchSchedulerManager != nil {
 		if scheduler, err := r.options.BatchSchedulerManager.GetScheduler(); err == nil {
 			scheduler.AddMetadataToChildResource(ctx, &instance, &pod, worker.GroupName)
@@ -1366,11 +1452,11 @@ func (r *RayClusterReconciler) createWorkerPod(ctx context.Context, instance ray
 	return nil
 }
 
-func (r *RayClusterReconciler) createWorkerPodWithIndex(ctx context.Context, instance rayv1.RayCluster, worker rayv1.WorkerGroupSpec, replicaGrpName string, replicaIndex int, hostIndex int) error {
+func (r *RayClusterReconciler) createWorkerPodWithIndex(ctx context.Context, instance rayv1.RayCluster, worker rayv1.WorkerGroupSpec, replicaGrpName string, replicaIndex int, hostIndex int, hcclRank int) error {
 	logger := ctrl.LoggerFrom(ctx)
 
 	// build the pod then create it
-	pod := r.buildWorkerPod(ctx, instance, worker, replicaGrpName, replicaIndex, hostIndex)
+	pod := r.buildWorkerPod(ctx, instance, worker, replicaGrpName, replicaIndex, hostIndex, hcclRank)
 	if r.options.BatchSchedulerManager != nil {
 		if scheduler, err := r.options.BatchSchedulerManager.GetScheduler(); err == nil {
 			scheduler.AddMetadataToChildResource(ctx, &instance, &pod, worker.GroupName)
@@ -1419,7 +1505,7 @@ func getCreatorCRDType(instance rayv1.RayCluster) utils.CRDType {
 }
 
 // Build worker instance pods.
-func (r *RayClusterReconciler) buildWorkerPod(ctx context.Context, instance rayv1.RayCluster, worker rayv1.WorkerGroupSpec, replicaGrpName string, replicaIndex int, hostIndex int) corev1.Pod {
+func (r *RayClusterReconciler) buildWorkerPod(ctx context.Context, instance rayv1.RayCluster, worker rayv1.WorkerGroupSpec, replicaGrpName string, replicaIndex int, hostIndex int, hcclRank int) corev1.Pod {
 	logger := ctrl.LoggerFrom(ctx)
 	podName := utils.PodName(fmt.Sprintf("%s-%s", instance.Name, worker.GroupName), rayv1.WorkerNode, true)
 	fqdnRayIP := utils.GenerateFQDNServiceName(ctx, instance, instance.Namespace) // Fully Qualified Domain Name
@@ -1437,6 +1523,7 @@ func (r *RayClusterReconciler) buildWorkerPod(ctx context.Context, instance rayv
 	if err := controllerutil.SetControllerReference(&instance, &pod, r.Scheme); err != nil {
 		logger.Error(err, "Failed to set controller reference for raycluster pod")
 	}
+	utils.AddHcclRankIndexToPod(&pod, instance, hcclRank)
 
 	return pod
 }

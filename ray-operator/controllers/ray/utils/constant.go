@@ -55,6 +55,13 @@ const (
 	RayPriorityClassName     = "ray.io/priority-class-name"
 	RayGangSchedulingEnabled = "ray.io/gang-scheduling-enabled"
 
+	// HwPreName is the domain prefix for Huawei NPU / Ascend extended resource names in container
+	// Requests/Limits (e.g. huawei.com/ascend-xxx). IsNPUCluster detects these on head and worker pod templates.
+	HwPreName = "huawei.com/"
+	// HcclRankIndexAnnotationKey is set on the head Pod (0) and worker Pods (1..N) for NPU clusters
+	// so HCCL can assign device ranks in global order.
+	HcclRankIndexAnnotationKey = "hccl/rankIndex"
+
 	// Ray GCS FT related annotations
 	RayFTEnabledAnnotationKey         = "ray.io/ft-enabled"
 	RayExternalStorageNSAnnotationKey = "ray.io/external-storage-namespace"

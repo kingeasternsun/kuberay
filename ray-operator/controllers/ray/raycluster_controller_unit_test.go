@@ -3677,6 +3677,93 @@ func TestReconcile_PodsWithAuthToken(t *testing.T) {
 	}
 }
 
+// TestReconcilePods_HcclRankIndex runs reconcilePods against a fresh client and checks that
+// NPU RayClusters (Huawei extended resource on pod templates) get utils.HcclRankIndexAnnotationKey
+// on head (0) and workers (1..N); without NPU resources the annotation is not set.
+func TestReconcilePods_HcclRankIndex(t *testing.T) {
+	setupTest(t)
+	ctx := context.Background()
+
+	npuRes := corev1.ResourceName(utils.HwPreName + "npu")
+	npuRequest := resource.MustParse("1")
+	applyNPU := func(c *rayv1.RayCluster) {
+		for i := range c.Spec.HeadGroupSpec.Template.Spec.Containers {
+			c.Spec.HeadGroupSpec.Template.Spec.Containers[i].Resources = corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{npuRes: npuRequest},
+			}
+		}
+		c.Spec.WorkerGroupSpecs[0].Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{npuRes: npuRequest},
+		}
+	}
+
+	t.Run("NPU cluster: head rank 0 and workers get sequential ranks", func(t *testing.T) {
+		c := testRayCluster.DeepCopy()
+		require.NotNil(t, c)
+		c.Spec.WorkerGroupSpecs[0].Replicas = ptr.To[int32](2)
+		c.Spec.WorkerGroupSpecs[0].ScaleStrategy = rayv1.ScaleStrategy{WorkersToDelete: []string{}}
+		applyNPU(c)
+		require.True(t, utils.IsNPUCluster(c))
+
+		fakeClient := clientFake.NewClientBuilder().WithRuntimeObjects().Build()
+		r := &RayClusterReconciler{
+			Client:                     fakeClient,
+			Recorder:                   &record.FakeRecorder{},
+			Scheme:                     scheme.Scheme,
+			rayClusterScaleExpectation: expectations.NewRayClusterScaleExpectation(fakeClient),
+		}
+		err := r.reconcilePods(ctx, c)
+		require.NoError(t, err)
+
+		podList := corev1.PodList{}
+		err = fakeClient.List(ctx, &podList, client.InNamespace(namespaceStr))
+		require.NoError(t, err)
+		require.Len(t, podList.Items, 1+2, "expect 1 head and 2 worker pods")
+
+		var headRank string
+		var workerRanks []string
+		for i := range podList.Items {
+			p := &podList.Items[i]
+			rk, ok := p.Annotations[utils.HcclRankIndexAnnotationKey]
+			require.Truef(t, ok, "Pod %q missing %s", p.Name, utils.HcclRankIndexAnnotationKey)
+			if p.Labels[utils.RayNodeTypeLabelKey] == string(rayv1.HeadNode) {
+				headRank = rk
+			} else {
+				workerRanks = append(workerRanks, rk)
+			}
+		}
+		assert.Equal(t, "0", headRank, "head pod should have hccl rank 0")
+		assert.ElementsMatch(t, []string{"1", "2"}, workerRanks, "worker pods should have global hccl ranks 1 and 2")
+	})
+
+	t.Run("non-NPU cluster: no hccl/rankIndex on pods", func(t *testing.T) {
+		c := testRayCluster.DeepCopy()
+		require.NotNil(t, c)
+		c.Spec.WorkerGroupSpecs[0].Replicas = ptr.To[int32](1)
+		c.Spec.WorkerGroupSpecs[0].ScaleStrategy = rayv1.ScaleStrategy{WorkersToDelete: []string{}}
+		require.False(t, utils.IsNPUCluster(c))
+
+		fakeClient := clientFake.NewClientBuilder().WithRuntimeObjects().Build()
+		r := &RayClusterReconciler{
+			Client:                     fakeClient,
+			Recorder:                   &record.FakeRecorder{},
+			Scheme:                     scheme.Scheme,
+			rayClusterScaleExpectation: expectations.NewRayClusterScaleExpectation(fakeClient),
+		}
+		err := r.reconcilePods(ctx, c)
+		require.NoError(t, err)
+
+		podList := corev1.PodList{}
+		err = fakeClient.List(ctx, &podList, client.InNamespace(namespaceStr))
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, len(podList.Items), 1)
+		for i := range podList.Items {
+			_, has := podList.Items[i].Annotations[utils.HcclRankIndexAnnotationKey]
+			assert.False(t, has, "pod %q should not have %s when not an NPU cluster", podList.Items[i].Name, utils.HcclRankIndexAnnotationKey)
+		}
+	})
+}
+
 func TestShouldRecreatePodsForUpgrade(t *testing.T) {
 	setupTest(t)
 	ctx := context.Background()

@@ -1074,3 +1074,106 @@ func IsHTTPRouteEqual(existing, desired *gwv1.HTTPRoute) bool {
 	}
 	return true
 }
+
+// resourceNameHasHwPreName reports whether a Kubernetes resource name (Requests/Limits key) uses the Huawei
+// device extended resource domain.
+func resourceNameHasHwPreName(name corev1.ResourceName) bool {
+	return strings.HasPrefix(string(name), HwPreName)
+}
+
+// resourceListHasNPUResource returns true if any key in the ResourceList is prefixed with HwPreName.
+func resourceListHasNPUResource(rl corev1.ResourceList) bool {
+	if len(rl) == 0 {
+		return false
+	}
+	for name := range rl {
+		if resourceNameHasHwPreName(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// containersIndicateNPU returns true if any container has Requests or Limits mentioning Huawei NPU resources.
+func containersIndicateNPU(containers []corev1.Container) bool {
+	for i := range containers {
+		c := &containers[i]
+		if resourceListHasNPUResource(c.Resources.Requests) || resourceListHasNPUResource(c.Resources.Limits) {
+			return true
+		}
+	}
+	return false
+}
+
+// podSpecIndicateNPU inspects the Pod spec derived from head or worker group templates.
+func podSpecIndicateNPU(spec *corev1.PodSpec) bool {
+	if spec == nil {
+		return false
+	}
+	return containersIndicateNPU(spec.Containers) || containersIndicateNPU(spec.InitContainers)
+}
+
+// IsNPUCluster reports whether the cluster is configured for Huawei NPU (Ascend) by checking head
+// HeadGroupSpec.Template.Spec and every WorkerGroupSpec.Template.Spec: if any container's Resources
+// Requests or Limits use an extended resource name with prefix HwPreName, the cluster is treated as NPU.
+func IsNPUCluster(instance *rayv1.RayCluster) bool {
+	if instance == nil {
+		return false
+	}
+	if podSpecIndicateNPU(&instance.Spec.HeadGroupSpec.Template.Spec) {
+		return true
+	}
+	for i := range instance.Spec.WorkerGroupSpecs {
+		if podSpecIndicateNPU(&instance.Spec.WorkerGroupSpecs[i].Template.Spec) {
+			return true
+		}
+	}
+	return false
+}
+
+// AddHcclRankIndexToPod sets HcclRankIndexAnnotationKey on the Pod when the RayCluster is an NPU cluster.
+func AddHcclRankIndexToPod(pod *corev1.Pod, instance rayv1.RayCluster, rank int) {
+	if !IsNPUCluster(&instance) {
+		return
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations[HcclRankIndexAnnotationKey] = strconv.Itoa(rank)
+}
+
+// HcclRankSetFromPods collects distinct hccl/rankIndex values already present on Pods (invalid values are skipped).
+func HcclRankSetFromPods(pods []corev1.Pod) map[int]struct{} {
+	used := make(map[int]struct{})
+	for i := range pods {
+		v, ok := pods[i].Annotations[HcclRankIndexAnnotationKey]
+		if !ok || strings.TrimSpace(v) == "" {
+			continue
+		}
+		r, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			continue
+		}
+		used[r] = struct{}{}
+	}
+	return used
+}
+
+// AllocateHcclWorkerRanks returns the subset of expected HCCL worker ranks for this group that are not yet in occupied.
+// Expected ranks are priorWorkerPodTotalFromPriorGroups+1 .. priorWorkerPodTotalFromPriorGroups+numExpectedWorkerPodsInGroup
+// (global worker sequence; head is 0). priorWorkerPodTotalFromPriorGroups is the sum of GetWorkerGroupDesiredReplicas
+// over all WorkerGroupSpecs before this group in spec order.
+func AllocateHcclWorkerRanks(occupied map[int]struct{}, priorWorkerPodTotalFromPriorGroups int, numExpectedWorkerPodsInGroup int) []int {
+	if numExpectedWorkerPodsInGroup < 1 {
+		return nil
+	}
+	low := priorWorkerPodTotalFromPriorGroups + 1
+	high := priorWorkerPodTotalFromPriorGroups + numExpectedWorkerPodsInGroup
+	out := make([]int, 0, numExpectedWorkerPodsInGroup)
+	for r := low; r <= high; r++ {
+		if _, ok := occupied[r]; !ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}

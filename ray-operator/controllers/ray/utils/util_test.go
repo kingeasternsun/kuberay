@@ -1926,3 +1926,148 @@ func TestIsHTTPRouteEqual(t *testing.T) {
 		})
 	}
 }
+
+func npuResourceList() corev1.ResourceList {
+	return corev1.ResourceList{
+		corev1.ResourceName(HwPreName + "npu-core"): resource.MustParse("1"),
+	}
+}
+
+func TestIsNPUCluster(t *testing.T) {
+	t.Run("nil instance", func(t *testing.T) {
+		assert.False(t, IsNPUCluster(nil))
+	})
+	t.Run("no pod resources", func(t *testing.T) {
+		c := &rayv1.RayCluster{}
+		assert.False(t, IsNPUCluster(c))
+	})
+	t.Run("only annotations no container resources", func(t *testing.T) {
+		c := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{HwPreName + "x": "y"}}}
+		assert.False(t, IsNPUCluster(c))
+	})
+	t.Run("head requests only non-huawei", func(t *testing.T) {
+		c := &rayv1.RayCluster{
+			Spec: rayv1.RayClusterSpec{
+				HeadGroupSpec: rayv1.HeadGroupSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name: "ray-head",
+								Resources: corev1.ResourceRequirements{
+									Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+								},
+							}},
+						},
+					},
+				},
+			},
+		}
+		assert.False(t, IsNPUCluster(c))
+	})
+	t.Run("head has huawei extended resource in requests", func(t *testing.T) {
+		c := &rayv1.RayCluster{
+			Spec: rayv1.RayClusterSpec{
+				HeadGroupSpec: rayv1.HeadGroupSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name:        "ray-head",
+								Resources: corev1.ResourceRequirements{Requests: npuResourceList()},
+							}},
+						},
+					},
+				},
+			},
+		}
+		assert.True(t, IsNPUCluster(c))
+	})
+	t.Run("worker has huawei in limits", func(t *testing.T) {
+		c := &rayv1.RayCluster{
+			Spec: rayv1.RayClusterSpec{
+				HeadGroupSpec: rayv1.HeadGroupSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{}}},
+				WorkerGroupSpecs: []rayv1.WorkerGroupSpec{{
+					GroupName: "w",
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name:        "ray-worker",
+								Resources: corev1.ResourceRequirements{Limits: npuResourceList()},
+							}},
+						},
+					},
+				}},
+			},
+		}
+		assert.True(t, IsNPUCluster(c))
+	})
+	t.Run("initContainer has npu in requests", func(t *testing.T) {
+		c := &rayv1.RayCluster{
+			Spec: rayv1.RayClusterSpec{
+				HeadGroupSpec: rayv1.HeadGroupSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							InitContainers: []corev1.Container{{
+								Name:        "init",
+								Resources: corev1.ResourceRequirements{Requests: npuResourceList()},
+							}},
+							Containers: []corev1.Container{{Name: "ray-head"}},
+						},
+					},
+				},
+			},
+		}
+		assert.True(t, IsNPUCluster(c))
+	})
+}
+
+func TestAddHcclRankIndexToPod(t *testing.T) {
+	pod := &corev1.Pod{}
+	cluster := rayv1.RayCluster{}
+	AddHcclRankIndexToPod(pod, cluster, 0)
+	assert.Empty(t, pod.Annotations)
+
+	cluster.Spec.HeadGroupSpec = rayv1.HeadGroupSpec{
+		Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:        "ray-head",
+					Resources: corev1.ResourceRequirements{Requests: npuResourceList()},
+				}},
+			},
+		},
+	}
+	AddHcclRankIndexToPod(pod, cluster, 3)
+	require.NotNil(t, pod.Annotations)
+	assert.Equal(t, "3", pod.Annotations[HcclRankIndexAnnotationKey])
+}
+
+func TestHcclRankSetFromPods(t *testing.T) {
+	pods := []corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{HcclRankIndexAnnotationKey: "1"}}},
+		{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{HcclRankIndexAnnotationKey: "bad"}}},
+		{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{HcclRankIndexAnnotationKey: " 3 "}}},
+	}
+	got := HcclRankSetFromPods(pods)
+	assert.Len(t, got, 2)
+	_, ok1 := got[1]
+	_, ok3 := got[3]
+	assert.True(t, ok1)
+	assert.True(t, ok3)
+}
+
+func TestAllocateHcclWorkerRanks(t *testing.T) {
+	t.Run("all missing in range", func(t *testing.T) {
+		assert.Equal(t, []int{1, 2, 3}, AllocateHcclWorkerRanks(nil, 0, 3))
+	})
+	t.Run("gaps inside range", func(t *testing.T) {
+		occ := map[int]struct{}{1: {}, 3: {}}
+		assert.Equal(t, []int{2, 4, 5}, AllocateHcclWorkerRanks(occ, 0, 5))
+	})
+	t.Run("none left in range", func(t *testing.T) {
+		occ := map[int]struct{}{1: {}, 2: {}, 3: {}}
+		assert.Empty(t, AllocateHcclWorkerRanks(occ, 0, 3))
+	})
+	t.Run("second group global offset", func(t *testing.T) {
+		assert.Equal(t, []int{4, 5, 6}, AllocateHcclWorkerRanks(nil, 3, 3))
+	})
+}
