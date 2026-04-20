@@ -6,13 +6,6 @@ IMG ?= controller:latest
 # Golang forbids converting float from Json to struct. Need allowDangerousTypes=true to unblock build.
 CRD_OPTIONS ?= "crd:maxDescLen=0,generateEmbeddedObjectMeta=true,allowDangerousTypes=true"
 
-# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set).
-ifeq (,$(shell go env GOBIN))
-GOBIN=$(shell go env GOPATH)/bin
-else
-GOBIN=$(shell go env GOBIN)
-endif
-
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # This is a requirement for 'setup-envtest.sh' in the test target.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
@@ -21,6 +14,33 @@ SHELL = /usr/bin/env bash -o pipefail
 
 # Container Engine for building images.
 ENGINE ?= "docker"
+# Volcano-style: Go base image (override with DaoCloud mirror if needed, e.g.
+# docker.m.daocloud.io/library/golang:1.25-bookworm).
+GOLANG_IMAGE ?= golang:1.25-bookworm
+GOPROXY ?= https://goproxy.cn,direct
+DOCKER_BUILD_ARGS ?= --build-arg GOLANG_IMAGE=$(GOLANG_IMAGE) --build-arg GOPROXY="$(GOPROXY)"
+IMAGE_PREFIX ?= quay.io/kuberay
+IMAGE_TAG ?= nightly
+
+OSARCH := $(shell uname -m)
+ifeq ($(OSARCH),x86_64)
+GOARCH ?= amd64
+else ifeq ($(OSARCH),x64)
+GOARCH ?= amd64
+else ifeq ($(OSARCH),aarch64)
+GOARCH ?= arm64
+else ifeq ($(OSARCH),arm64)
+GOARCH ?= arm64
+else
+GOARCH ?= $(OSARCH)
+endif
+
+# Default to local architecture; override to multi-platform, e.g. linux/amd64,linux/arm64.
+DOCKER_PLATFORMS ?= linux/$(GOARCH)
+# Supported outputs include docker, registry, oci, tar.
+BUILDX_OUTPUT_TYPE ?= docker
+OPERATOR_IMAGE ?= $(IMAGE_PREFIX)/operator:$(IMAGE_TAG)
+SUBMITTER_IMAGE ?= $(IMAGE_PREFIX)/submitter:$(IMAGE_TAG)
 
 all: build
 
@@ -64,13 +84,12 @@ fumpt: gofumpt
 
 # TODO: Remove this once a fix for https://github.com/golang/go/issues/75031 is released.
 # This is a workaround for an issue where `go test -cover` reports errors for packages with no test files.
-GOVERSION := $(shell go env GOVERSION)
-export GOTOOLCHAIN := $(GOVERSION)+auto
+# GOTOOLCHAIN is set only in the test recipe so targets like `make images` work on hosts without a Go toolchain.
 
 test: WHAT ?= $(shell go list ./... | grep -v /test/)
 test: ENVTEST_K8S_VERSION ?= 1.34.1
 test: manifests fmt vet envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $(WHAT) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GOTOOLCHAIN="$$(go env GOVERSION)+auto" go test $(WHAT) -coverprofile cover.out
 
 test-e2e: WHAT ?= ./test/e2e
 test-e2e: manifests fmt vet ## Run e2e tests.
@@ -127,7 +146,7 @@ build-rayjob-submitter:
 	go build -o bin/submitter ./rayjob-submitter/cmd/main.go
 
 docker-image: ## Build image only
-	${ENGINE} build -t ${IMG} .
+	${ENGINE} build ${DOCKER_BUILD_ARGS} -t ${IMG} .
 
 docker-build: build docker-image ## Build image with the manager.
 
@@ -135,13 +154,20 @@ docker-push: ## Push image with the manager.
 	${ENGINE} push ${IMG}
 
 docker-multi-arch-build: ## Build multi-arch images for amd64 and arm64.
-	${ENGINE} buildx build --platform linux/amd64,linux/arm64 -t ${IMG} .
+	${ENGINE} buildx build ${DOCKER_BUILD_ARGS} --platform linux/amd64,linux/arm64 -t ${IMG} .
 
 docker-multi-arch-push: ## Build and push multi-arch images for amd64 and arm64.
-	${ENGINE} buildx build --push --platform linux/amd64,linux/arm64 -t ${IMG} .
+	${ENGINE} buildx build ${DOCKER_BUILD_ARGS} --push --platform linux/amd64,linux/arm64 -t ${IMG} .
 
 docker-image-rayjob-submitter:
-	${ENGINE} build -t ${IMG} --target submitter .
+	${ENGINE} build ${DOCKER_BUILD_ARGS} -t ${IMG} --target submitter .
+
+# Volcano-style multi-platform push example:
+# make images DOCKER_PLATFORMS="linux/amd64,linux/arm64" BUILDX_OUTPUT_TYPE=registry \
+#   IMAGE_PREFIX=<yourregistry> GOLANG_IMAGE=docker.m.daocloud.io/library/golang:1.25-bookworm GOPROXY=https://goproxy.cn,direct
+images: ## Build operator and submitter images via buildx.
+	${ENGINE} buildx build -f Dockerfile ${DOCKER_BUILD_ARGS} -t ${OPERATOR_IMAGE} . --output=type=${BUILDX_OUTPUT_TYPE} --platform ${DOCKER_PLATFORMS}
+	${ENGINE} buildx build -f Dockerfile ${DOCKER_BUILD_ARGS} --target submitter -t ${SUBMITTER_IMAGE} . --output=type=${BUILDX_OUTPUT_TYPE} --platform ${DOCKER_PLATFORMS}
 
 ##@ Deployment
 
